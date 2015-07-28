@@ -28,10 +28,19 @@ setMethod("savR", signature("character"), function(object) {
   } 
   retval@reads <- reads
   layout <- XML::xpathApply(runinfo, "/RunInfo/Run/FlowcellLayout")[[1]]
+  layoutChildren <- XML::xmlChildren(layout)
+  tnc <- ""
+  if (length(layoutChildren) > 0) {
+    tnc <- XML::xmlAttrs(layoutChildren$TileSet)["TileNamingConvention"]
+  }
   retval@layout <- new("illuminaFlowCellLayout", lanecount=as.integer(XML::xmlAttrs(layout)["LaneCount"]),
                        surfacecount=as.integer(XML::xmlAttrs(layout)["SurfaceCount"]),
                        swathcount=as.integer(XML::xmlAttrs(layout)["SwathCount"]),
-                       tilecount=as.integer(XML::xmlAttrs(layout)["TileCount"]) )
+                       tilecount=as.integer(XML::xmlAttrs(layout)["TileCount"]),
+                       sectionperlane=as.integer(XML::xmlAttrs(layout)["SectionPerLane"]),
+                       lanepersection=as.integer(XML::xmlAttrs(layout)["LanePerSection"]),
+                       tilenamingconvention=as.character(tnc)
+                       )
   return(init(retval))
 } )
 
@@ -242,7 +251,6 @@ setMethod("qualityHeatmap", signature(project="savProject", lane="integer", read
   
   for (x in 1:length(read)) {
     mat <- qFormat(data=project@parsedData[[formatName]]@data, lane=lane, cycles=readToCycles(project, read[x]), collapse)
-    print(summary(mat))
     plots[[x]] <- ggplot2::ggplot(mat, ggplot2::aes(x=x, y=y, z=z)) + 
       ggplot2::stat_contour(bins=50, geom="polygon", ggplot2::aes(fill=..level..)) + ggplot2::ylim(0,50) + 
       ggplot2::theme_bw() + ggplot2::scale_fill_gradient2(low="white", mid=scales::muted("green"), high="red", midpoint=quantile(mat$z, .99) ) + 
@@ -388,8 +396,15 @@ parseBinData <- function(project, format, fh) {
   for (x in project@reads) {
     readlen <- readlen + x@cycles
   }
-  proj.size <- project@layout@lanecount * project@layout@surfacecount * 
-    project@layout@swathcount * project@layout@tilecount * readlen + 1
+  proj.size <- 0
+  if (project@layout@tilenamingconvention == "FiveDigit") {
+    proj.size <- project@layout@lanecount * project@layout@surfacecount *
+      project@layout@swathcount * project@layout@sectionperlane *
+      project@layout@lanepersection * project@layout@tilecount * readlen + 1
+  } else {
+    proj.size <- project@layout@lanecount * project@layout@surfacecount * 
+      project@layout@swathcount * project@layout@tilecount * readlen + 1
+  }
   data <- vector("list", proj.size)
   r <- 1
   while (!isIncomplete(fh)) {
@@ -417,10 +432,13 @@ parseBinData <- function(project, format, fh) {
   # remove NULL rows
   data.f <- as.data.frame(do.call("rbind", data[!unlist(lapply(data, is.null))] ))
   colnames(data.f) <- format@name
-  if (max(data.f[,"lane"]) != project@layout@lanecount)
-    stop(paste("number of lanes in data file ( ", max(data.f[,"lane"]), ") does not equal project configuration value (" 
-               + project@layout@lanecount + ")", sep=""))
-  
+  actnum <- length(unique(data.f[,"lane"]))
+  if (format@filename == "ErrorMetricsOut.bin") {
+    # no consistent way to determine which lanes were called?
+  } else if (actnum != project@layout@lanecount) {
+    stop(paste("number of lanes in data file (", actnum, ") does not equal project configuration value (", 
+      project@layout@lanecount, ") when parsing ", format@filename, sep=""))
+  }
   data.f <- data.f[do.call(order, as.list(data.f[,format@order])),]
   return(data.f)
 }
@@ -506,15 +524,26 @@ init <- function(project) {
 
       parsedData <- NULL
       data <- NULL
+      success <- FALSE
       
-      if (format@default == T) {
-        parsedData <- parseBin(project, format)
-      } else {
-        f <- get(paste("parse", x, sep=""))
-        parsedData <- f(project, format)
-      }
-
-      fileSuccess[format@filename] <- TRUE      
+      tryCatch({
+        if (format@default == T) {
+          parsedData <- parseBin(project, format)
+        } else {
+          f <- get(paste("parse", x, sep=""))
+          parsedData <- f(project, format)
+        }
+        success <- TRUE
+      },
+      error = function(e) {
+        warning("Unable to parse binary data: ", geterrmessage())
+      },
+      finally = {
+      })
+      
+      if (success == FALSE) next
+      
+      fileSuccess[format@filename] <- success      
       
       data <- parsedData@data
       
@@ -543,6 +572,10 @@ testVersion <- function(project, format) {
   fh <- file(path, "rb")
   vers <- readBin(fh, what="integer", endian="little", size=1, signed=F)
   close(fh)
+  if (length(vers) == 0) {
+    warning(paste("Unable to determine file version: empty", format@filename, "binary file?", sep=" "))
+    vers <- -1
+  }
   if (vers == format@version) {
     matched <- TRUE 
   }
@@ -580,20 +613,23 @@ parsesavQualityFormatV5 <- function(project, format) {
   vers <- readBin(fh, what="integer", endian="little", size=1, signed=F)
   reclen <- readBin(fh, what="integer", endian="little", size=1, signed=F)
   binning <- readBin(fh, what="integer", endian="little", size=1, signed=F)
-  nBins <- readBin(fh, what="integer", endian="little", size=1, signed=F)
   
   lowB <- c()
   upB <- c()
   remapB <- c()
-  
-  for (x in 1:nBins) {
-    lowB <- c(lowB, readBin(fh, what="integer", endian="little", size=1, signed=F))
-  }
-  for (x in 1:nBins) {
-    upB <- c(upB, readBin(fh, what="integer", endian="little", size=1, signed=F))
-  }
-  for (x in 1:nBins) {
-    remapB <- c(remapB, readBin(fh, what="integer", endian="little", size=1, signed=F))
+  nBins <- 0
+ 
+  if (binning == 1) { 
+    nBins <- readBin(fh, what="integer", endian="little", size=1, signed=F)
+    for (x in 1:nBins) {
+      lowB <- c(lowB, readBin(fh, what="integer", endian="little", size=1, signed=F))
+    }
+    for (x in 1:nBins) {
+      upB <- c(upB, readBin(fh, what="integer", endian="little", size=1, signed=F))
+    }
+    for (x in 1:nBins) {
+      remapB <- c(remapB, readBin(fh, what="integer", endian="little", size=1, signed=F))
+    }
   }
   
   # end header processing
